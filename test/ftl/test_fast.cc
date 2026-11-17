@@ -78,6 +78,18 @@ static void verify(FAST &f, Parameter &p, std::set<uint64_t> &model, const char 
   for (auto &e : f.rwMap) {
     CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), e.second.first) != f.rwLogs.end(), "[%s %d] rwMap points outside rw logs", when, step);
   }
+  std::map<uint32_t, std::map<uint64_t, uint32_t>> counts;
+  for (auto pbn : f.rwLogs) counts[pbn];
+  for (const auto &e : f.rwMap)
+    counts[e.second.first][e.first / U / p.pagesInBlock]++;
+  CHECK(f.rwState.size() == f.rwLogs.size(), "RW metadata lifetime");
+  for (auto pbn : f.rwLogs) {
+    const auto &actual = f.rwState.at(pbn).sectors;
+    CHECK(actual.size() == counts[pbn].size(), "RW LBN count");
+    for (const auto &e : counts[pbn])
+      CHECK(actual.count(e.first) && actual.at(e.first) == e.second, "RW sector count");
+  }
+  CHECK(f.updateHistory.size() <= f.historyWindow, "history bounded");
   CHECK(f.rwLogs.size() <= f.maxRWLogs, "[%s %d] too many rw logs", when, step);
 }
 
@@ -130,10 +142,13 @@ int main(int argc, char **argv) {
   p.ioUnitInPage = 4;
   p.pageCountToMaxPerf = 4;
 
-  for (int ioUnit : {4, 1}) {
+  for (int policy : {0, 1}) for (int ioUnit : {1, 2, 4, 8}) {
     p.ioUnitInPage = ioUnit;
     FAST f(conf, p, nullptr, nullptr);
     f.bSendToPAL = false;
+    f.victimPolicy = policy;
+    f.historyWindow = 128;
+    f.maxDeferrals = 4;
     std::set<uint64_t> model;
     std::mt19937_64 rng(1234 + ioUnit);
     uint64_t total = p.totalLogicalBlocks * p.pagesInBlock;
@@ -200,5 +215,130 @@ int main(int argc, char **argv) {
     }
     printf("ioUnit %d OK: steps=%d switch=%" PRIu64 " partial=%" PRIu64 " full=%" PRIu64 " victims=%" PRIu64 "\n", ioUnit, step, f.stat.switchMerge, f.stat.partialMerge, f.stat.fullMerge, f.stat.rwVictims);
   }
+
+  // Three full logs, one LBN each. Heat favors preserving the oldest log.
+  // A continued host write removes its last valid sectors across all lanes.
+  for (int lanes : {1, 2, 4, 8}) {
+    p.ioUnitInPage = lanes;
+    p.pagesInBlock = 4;
+    for (int policy : {0, 1}) {
+      FAST f(conf, p, nullptr, nullptr);
+      f.bSendToPAL = false;
+      f.victimPolicy = policy;
+      f.historyWindow = 128;
+      Request req(lanes);
+      req.ioFlag.set();
+      uint64_t tick = 0;
+      std::set<uint64_t> model;
+      auto write = [&](uint64_t lpn) {
+        req.lpn = lpn;
+        f.writeInternal(req, tick);
+        for (int lane = 0; lane < lanes; ++lane)
+          model.insert(lpn * lanes + lane);
+        verify(f, p, model, "controlled", int(lpn));
+      };
+      for (uint64_t lpn = 0; lpn < 12; ++lpn) write(lpn);
+      for (uint64_t lpn : {1, 5, 9})
+        for (int n = 0; n < 4; ++n) write(lpn);
+      CHECK(f.rwLogs.size() == 3, "controlled setup logs");
+      auto hot = f.rwLogs.front();
+      auto before = f.stat.fullMerge;
+      write(1); // GC reclaims another log, then hot sectors get overwritten.
+      if (policy == 1) {
+        CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), hot) != f.rwLogs.end(),
+              "hot log retained while another log reclaimed");
+        CHECK(f.rwState.at(hot).sectors.empty(), "all lanes of hot LBN vanished");
+        CHECK(f.stat.vanishedOverwrite == 1, "one LBN disappearance, not per lane");
+        CHECK(f.stat.fullMerge == before + 1, "other log merged without waiting");
+        auto merges = f.stat.fullMerge;
+        f.beginBatch(tick);
+        f.mergeRWVictim(); // empty deferred log needs no full merge
+        CHECK(f.stat.fullMerge == merges, "empty log reclaimed without full merge");
+      } else {
+        CHECK(std::find(f.rwLogs.begin(), f.rwLogs.end(), hot) == f.rwLogs.end(),
+              "FIFO reclaimed oldest hot log");
+        f.beginBatch(tick);
+        f.mergeRWVictim();
+        CHECK(f.stat.fullMerge == before + 2, "FIFO needs two full merges");
+      }
+      printf("Controlled lanes=%d policy=%d full=%llu vanished=%llu\n",
+             lanes, policy, (unsigned long long)f.stat.fullMerge,
+             (unsigned long long)f.stat.vanishedOverwrite);
+    }
+  }
+
+  // Rewriting in a still-open RW log does not remove its LBN membership.
+  {
+    p.ioUnitInPage = 4;
+    p.pagesInBlock = 4;
+    FAST f(conf, p, nullptr, nullptr);
+    f.bSendToPAL = false;
+    f.victimPolicy = 1;
+    Request req(4);
+    req.ioFlag.set();
+    uint64_t tick = 0;
+    for (uint64_t lpn = 0; lpn < 4; ++lpn) {
+      req.lpn = lpn;
+      f.writeInternal(req, tick);
+    }
+    req.lpn = 1;
+    f.writeInternal(req, tick);
+    auto log = f.rwLogs.front();
+    f.rwState.at(log).watched.insert(0);
+    f.writeInternal(req, tick);
+    CHECK(f.stat.vanishedOverwrite == 0, "same log rewrite is not disappearance");
+    CHECK(f.rwState.at(log).watched.count(0) == 1, "same log watch preserved");
+    f.trimInternal(req, tick);
+    CHECK(f.stat.vanishedOverwrite == 0 && f.stat.vanishedTrim == 1,
+          "trim disappearance is not host overwrite");
+  }
+
+  // Window decay, cost gate, FIFO ties, empty priority and starvation cap.
+  {
+    FAST f(conf, p, nullptr, nullptr);
+    f.bSendToPAL = false;
+    f.victimPolicy = 1;
+    f.historyWindow = 2;
+    f.recordWrite(0, true);
+    f.recordWrite(1, false);
+    f.recordWrite(1, false);
+    CHECK(f.recentUpdates.empty(), "heat expires on host writes");
+    CHECK(f.updateHistory.empty(), "expired events removed");
+    f.rwLogs = {10, 11};
+    f.rwState[10].sectors = {{0, 1}};
+    f.rwState[11].sectors = {{1, 1}, {2, 1}, {3, 1}};
+    f.recentUpdates[0] = 100;
+    f.costSlack = 1;
+    CHECK(f.selectRWVictim() == 10, "cost gate rejects expensive cold log");
+    f.rwState[11].sectors = {{1, 1}};
+    CHECK(f.selectRWVictim() == 11, "cold candidate wins");
+    f.rwState[10].deferrals = f.maxDeferrals;
+    CHECK(f.selectRWVictim() == 10, "starvation cap");
+    f.rwState[11].sectors.clear();
+    CHECK(f.selectRWVictim() == 11, "empty log priority");
+    f.rwState[11].sectors = {{1, 1}};
+    f.rwState[10].deferrals = 0;
+    f.rwState[11].deferrals = 0;
+    f.recentUpdates.clear();
+    CHECK(f.selectRWVictim() == 10, "FIFO heat tie");
+    for (int cause : {0, 1, 2}) {
+      f.rwState[10].sectors = {{0, 1}};
+      f.rwState[10].watched.insert(0);
+      f.rwMap[0] = {10, 0};
+      f.removeRW(0, cause);
+    }
+    CHECK(f.stat.vanishedOverwrite == 1 && f.stat.vanishedMerge == 1 &&
+          f.stat.vanishedTrim == 1, "causes counted separately");
+    std::vector<Stats> names;
+    std::vector<double> values;
+    f.getStatList(names, "");
+    f.getStatValues(values);
+    CHECK(names.size() == values.size(), "stat name/value alignment");
+    f.resetStatValues();
+    CHECK(f.stat.vanishedOverwrite == 0 && f.stat.policyBypass == 0,
+          "reset statistics");
+  }
+
+  printf("Randomized FIFO/recent tests: %d failures\n", failures);
   return failures ? 1 : 0;
 }

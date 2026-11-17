@@ -47,6 +47,10 @@ typedef enum {
   FTL_NKMAP_K,
 
   /* FAST mapping configuration */
+  FTL_FAST_VICTIM_POLICY,
+  FTL_FAST_HISTORY_WINDOW,
+  FTL_FAST_COST_SLACK,
+  FTL_FAST_MAX_DEFERRALS,
   FTL_FAST_RW_LOG_BLOCKS,
 } FTL_CONFIG;
 
@@ -88,6 +92,7 @@ class Config : public BaseConfig {
   EVICT_POLICY evictPolicy;    //!< Default: POLICY_GREEDY
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
+  uint64_t fastVictimPolicy, fastHistoryWindow, fastCostSlack, fastMaxDeferrals;
   uint64_t fastRWLogBlocks;    //!< Default: 8 (FAST의 RW 로그 블록 수)
 
  public:

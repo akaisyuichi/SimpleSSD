@@ -55,6 +55,10 @@ Config::Config() {
   dChoiceParam = 3;
   randomIOTweak = true;
   fastRWLogBlocks = 8;
+  fastVictimPolicy = 0;
+  fastHistoryWindow = 4096;
+  fastCostSlack = 1;
+  fastMaxDeferrals = 8;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -99,6 +103,18 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_USE_RANDOM_IO_TWEAK)) {
     randomIOTweak = convertBool(value);
   }
+  else if (strcasecmp(name, "FASTVictimPolicy") == 0) {
+    fastVictimPolicy = strtoul(value, nullptr, 10);
+  }
+  else if (strcasecmp(name, "FASTHistoryWindow") == 0) {
+    fastHistoryWindow = strtoul(value, nullptr, 10);
+  }
+  else if (strcasecmp(name, "FASTCostSlack") == 0) {
+    fastCostSlack = strtoul(value, nullptr, 10);
+  }
+  else if (strcasecmp(name, "FASTMaxDeferrals") == 0) {
+    fastMaxDeferrals = strtoul(value, nullptr, 10);
+  }
   else if (MATCH_NAME(NAME_FAST_RW_LOG_BLOCKS)) {
     fastRWLogBlocks = strtoul(value, nullptr, 10);
   }
@@ -110,6 +126,9 @@ bool Config::setConfig(const char *name, const char *value) {
 }
 
 void Config::update() {
+  if (fastVictimPolicy > 1 || fastHistoryWindow == 0 || fastMaxDeferrals == 0) {
+    panic("Invalid FAST victim policy parameters");
+  }
   if (gcMode == GC_MODE_0 && reclaimBlock == 0) {
     panic("Invalid GCReclaimBlocks");
   }
@@ -161,6 +180,10 @@ uint64_t Config::readUint(uint32_t idx) {
     case FTL_GC_D_CHOICE_PARAM:
       ret = dChoiceParam;
       break;
+    case FTL_FAST_VICTIM_POLICY: return fastVictimPolicy;
+    case FTL_FAST_HISTORY_WINDOW: return fastHistoryWindow;
+    case FTL_FAST_COST_SLACK: return fastCostSlack;
+    case FTL_FAST_MAX_DEFERRALS: return fastMaxDeferrals;
     case FTL_FAST_RW_LOG_BLOCKS:
       ret = fastRWLogBlocks;
       break;

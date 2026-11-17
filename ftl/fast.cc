@@ -39,6 +39,10 @@ FAST::FAST(ConfigReader &c, Parameter &p, PAL::PAL *l, DRAM::AbstractDRAM *d)
       bSendToPAL(true),
       scratchBits(p.ioUnitInPage) {
   maxRWLogs = conf.readUint(CONFIG_FTL, FTL_FAST_RW_LOG_BLOCKS);
+  victimPolicy = conf.readUint(CONFIG_FTL, FTL_FAST_VICTIM_POLICY);
+  historyWindow = conf.readUint(CONFIG_FTL, FTL_FAST_HISTORY_WINDOW);
+  costSlack = conf.readUint(CONFIG_FTL, FTL_FAST_COST_SLACK);
+  maxDeferrals = conf.readUint(CONFIG_FTL, FTL_FAST_MAX_DEFERRALS);
 
   if (maxRWLogs == 0) {
     panic("ftl: FASTRWLogBlocks는 1 이상이어야 합니다");
@@ -101,6 +105,8 @@ bool FAST::initialize() {
 
   // 초기화 중에는 PAL에 요청을 보내지 않고 상태만 갱신한다
   bSendToPAL = false;
+  uint64_t measuredPolicy = victimPolicy;
+  victimPolicy = 0; // Identical FIFO warmup for both policies.
 
   // 1단계: 채우기
   if (mode == FILLING_MODE_0 || mode == FILLING_MODE_1) {
@@ -152,6 +158,10 @@ bool FAST::initialize() {
   }
 
   bSendToPAL = true;
+  victimPolicy = measuredPolicy;
+  updateHistory.clear();
+  recentUpdates.clear();
+  writeSequence = 0;
 
   // 초기화 과정의 통계는 버린다
   memset(&stat, 0, sizeof(stat));
@@ -538,14 +548,14 @@ bool FAST::findLatest(uint64_t lpn, uint32_t lane, uint32_t &pbn,
 }
 
 // (lpn, lane)의 현재 최신 버전을 무효화하고 RW 섹터 맵에서도 지운다
-void FAST::invalidateLatest(uint64_t lpn, uint32_t lane) {
+void FAST::invalidateLatest(uint64_t lpn, uint32_t lane, bool overwrite) {
   uint32_t pbn;
   uint32_t page;
 
   if (findLatest(lpn, lane, pbn, page)) {
     blocks.at(pbn).invalidate(page, lane);
 
-    rwMap.erase(lpn * param.ioUnitInPage + lane);
+    removeRW(lpn * param.ioUnitInPage + lane, overwrite ? 0 : 2);
   }
 }
 
@@ -578,7 +588,7 @@ void FAST::copySector(uint64_t lpn, uint32_t lane, uint32_t srcBlock,
 
   blocks.at(srcBlock).invalidate(srcPage, lane);
 
-  rwMap.erase(lpn * param.ioUnitInPage + lane);
+  removeRW(lpn * param.ioUnitInPage + lane, 1);
 
   writeSector(dstBlock, dstPage, lpn, lane);
 }
@@ -615,7 +625,7 @@ void FAST::startSW(uint64_t lbn) {
 
 // SW 로그의 해당 lane에 이어서 쓴다 (offset == swNext[lane]이어야 한다)
 void FAST::appendSW(uint64_t lpn, uint32_t lane) {
-  invalidateLatest(lpn, lane);
+  invalidateLatest(lpn, lane, true);
   writeSector(sw.pbn, swNext[lane], lpn, lane);
 
   swNext[lane]++;
@@ -742,11 +752,102 @@ void FAST::mergeLbn(uint64_t lbn) {
   stat.fullMerge++;
 }
 
-// RW 로그 중 가장 오래된 블록을 victim으로 골라 비운다.
-// victim에 유효 sector를 가진 모든 논리 블록을 각각 full merge 한다.
-// 여러 논리 블록의 merge 요청을 하나의 batch로 모아 채널/chip 병렬성을 쓴다.
+// Bounded host-write window, independent of NAND/GC latency and copies.
+void FAST::recordWrite(uint64_t lbn, bool overwrite) {
+  if (victimPolicy == 0) return;
+  ++writeSequence;
+  if (overwrite) {
+    updateHistory.emplace_back(writeSequence, lbn);
+    ++recentUpdates[lbn];
+  }
+  while (!updateHistory.empty() &&
+         writeSequence - updateHistory.front().first >= historyWindow) {
+    auto key = updateHistory.front().second;
+    if (--recentUpdates.at(key) == 0) recentUpdates.erase(key);
+    updateHistory.pop_front();
+  }
+}
+
+void FAST::removeRW(uint64_t key, uint32_t cause) {
+  auto it = rwMap.find(key);
+  if (it == rwMap.end()) return;
+  auto &state = rwState.at(it->second.first);
+  uint64_t lbn = key / param.ioUnitInPage / param.pagesInBlock;
+  if (--state.sectors.at(lbn) == 0) {
+    state.sectors.erase(lbn);
+    if (state.watched.erase(lbn)) {
+      if (cause == 0) ++stat.vanishedOverwrite;
+      else if (cause == 1) ++stat.vanishedMerge;
+      else ++stat.vanishedTrim;
+    }
+  }
+  rwMap.erase(it);
+}
+
+uint32_t FAST::selectRWVictim() {
+  uint32_t chosen = rwLogs.front();
+  if (victimPolicy == 0) return chosen;
+  size_t minCost = rwState.at(chosen).sectors.size();
+  for (auto pbn : rwLogs)
+    minCost = std::min(minCost, rwState.at(pbn).sectors.size());
+  bool forced = false;
+  double bestHeat = 0;
+  bool found = false;
+  // Empty logs are always reclaimed first; FIFO breaks every tie.
+  for (auto pbn : rwLogs) {
+    if (rwState.at(pbn).sectors.empty()) {
+      chosen = pbn;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    for (auto pbn : rwLogs) {
+      if (rwState.at(pbn).deferrals >= maxDeferrals) {
+        chosen = pbn;
+        forced = true;
+        found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    for (auto pbn : rwLogs) {
+      const auto &state = rwState.at(pbn);
+      if (state.sectors.size() - minCost > costSlack) continue;
+      double heat = 0;
+      uint64_t sectors = 0;
+      for (const auto &entry : state.sectors) {
+        auto recent = recentUpdates.find(entry.first);
+        if (recent != recentUpdates.end())
+          heat += double(entry.second) * recent->second;
+        sectors += entry.second;
+      }
+      heat /= sectors; // sector-weighted recent LBN overwrite activity
+      if (!found || heat < bestHeat) {
+        chosen = pbn;
+        bestHeat = heat;
+        found = true;
+      }
+    }
+  }
+  if (forced) ++stat.policyForced;
+  if (chosen != rwLogs.front()) ++stat.policyBypass;
+  stat.selectedLbns += rwState.at(chosen).sectors.size();
+  for (auto pbn : rwLogs) {
+    if (pbn == chosen) continue;
+    auto &state = rwState.at(pbn);
+    if (state.deferrals++ == 0) ++stat.deferredLogs;
+    for (const auto &entry : state.sectors) state.watched.insert(entry.first);
+  }
+  // Selected log disappearance is reclamation, not a deferral benefit.
+  rwState.at(chosen).watched.clear();
+  return chosen;
+}
+
+// Reclaim one chosen log now, merging each of its remaining live LBNs.
 void FAST::mergeRWVictim() {
-  uint32_t victim = rwLogs.front();
+  uint32_t victim = selectRWVictim();
   std::vector<uint64_t> unique;
   std::vector<uint64_t> lpns;
   Bitset bit(param.ioUnitInPage);
@@ -773,7 +874,8 @@ void FAST::mergeRWVictim() {
   }
 
   // 이제 victim에는 유효 sector가 없다
-  rwLogs.pop_front();
+  rwLogs.remove(victim);
+  rwState.erase(victim);
   eraseBlock(victim);
 
   stat.rwVictims++;
@@ -810,14 +912,21 @@ void FAST::writeToRW(uint64_t lpn, uint32_t lane) {
     rwLogs.push_back(getFreeBlock());
 
     target = rwLogs.back();
+    rwState.emplace(target, RWState{});
   }
 
   uint32_t page = blocks.at(target).getNextWritePageIndex(lane);
 
-  invalidateLatest(lpn, lane);
+  auto previous = rwMap.find(lpn * param.ioUnitInPage + lane);
+  uint64_t lbn = lpn / param.pagesInBlock;
+  bool sameLogWatch = previous != rwMap.end() &&
+      previous->second.first == target && rwState.at(target).watched.erase(lbn);
+  invalidateLatest(lpn, lane, true);
   writeSector(target, page, lpn, lane);
+  if (sameLogWatch) rwState.at(target).watched.insert(lbn);
 
   rwMap[lpn * param.ioUnitInPage + lane] = {target, page};
+  rwState[target].sectors[lpn / param.pagesInBlock]++;
 }
 
 // 데이터 블록에서 충돌이 난 sector를 로그 블록으로 보낸다 (논문 Algorithm 2)
@@ -924,7 +1033,9 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
     uint32_t dbn;
     bool collision = false;
 
-    if (!findLatest(lpn, lane, pbn, page)) {
+    bool mapped = findLatest(lpn, lane, pbn, page);
+    recordWrite(lbn, mapped);
+    if (!mapped) {
       mapSector(lpn);
     }
 
@@ -944,7 +1055,7 @@ void FAST::writeInternal(Request &req, uint64_t &tick) {
     }
 
     if (!collision) {
-      invalidateLatest(lpn, lane);
+      invalidateLatest(lpn, lane, true);
       writeSector(dbn, offset, lpn, lane);
     }
     else {
@@ -1020,6 +1131,27 @@ float FAST::calculateWearLeveling() {
 
 void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
   Stats temp;
+  temp.name = prefix + "fast.policy.bypass";
+  temp.desc = "policy.bypass";
+  list.push_back(temp);
+  temp.name = prefix + "fast.policy.forced";
+  temp.desc = "policy.forced";
+  list.push_back(temp);
+  temp.name = prefix + "fast.deferred.logs";
+  temp.desc = "deferred.logs";
+  list.push_back(temp);
+  temp.name = prefix + "fast.deferred.lbn_vanished.overwrite";
+  temp.desc = "deferred.lbn_vanished.overwrite";
+  list.push_back(temp);
+  temp.name = prefix + "fast.deferred.lbn_vanished.merge";
+  temp.desc = "deferred.lbn_vanished.merge";
+  list.push_back(temp);
+  temp.name = prefix + "fast.deferred.lbn_vanished.trim";
+  temp.desc = "deferred.lbn_vanished.trim";
+  list.push_back(temp);
+  temp.name = prefix + "fast.policy.selected_lbns";
+  temp.desc = "policy.selected_lbns";
+  list.push_back(temp);
 
   temp.name = prefix + "fast.merge.switch";
   temp.desc = "Total switch merge count";
@@ -1070,6 +1202,14 @@ void FAST::getStatList(std::vector<Stats> &list, std::string prefix) {
 }
 
 void FAST::getStatValues(std::vector<double> &values) {
+  values.push_back(stat.policyBypass);
+  values.push_back(stat.policyForced);
+  values.push_back(stat.deferredLogs);
+  values.push_back(stat.vanishedOverwrite);
+  values.push_back(stat.vanishedMerge);
+  values.push_back(stat.vanishedTrim);
+  values.push_back(stat.selectedLbns);
+
   values.push_back(stat.switchMerge);
   values.push_back(stat.partialMerge);
   values.push_back(stat.fullMerge);

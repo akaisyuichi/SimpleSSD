@@ -22,6 +22,8 @@
 
 #include <cinttypes>
 #include <list>
+#include <deque>
+#include <unordered_set>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -75,6 +77,21 @@ class FAST : public AbstractFTL {
   // RW(랜덤 쓰기) 로그 블록: 가장 앞이 가장 오래된 블록(victim 후보)
   std::list<uint32_t> rwLogs;
   uint32_t maxRWLogs;
+  uint64_t victimPolicy, historyWindow, costSlack, maxDeferrals;
+  struct RWState {
+    std::unordered_map<uint64_t, uint32_t> sectors;
+    std::unordered_set<uint64_t> watched;
+    uint64_t deferrals = 0;
+  };
+  std::unordered_map<uint32_t, RWState> rwState;
+  // Every host sector write advances the window; only overwrites add heat.
+  std::deque<std::pair<uint64_t, uint64_t>> updateHistory;
+  std::unordered_map<uint64_t, uint64_t> recentUpdates;
+  uint64_t writeSequence = 0;
+  void recordWrite(uint64_t, bool);
+  void removeRW(uint64_t, uint32_t); // cause: 0 overwrite, 1 merge, 2 trim
+  uint32_t selectRWVictim();
+
 
   // RW 로그의 섹터 매핑 테이블 (lpn * lane 수 + lane -> (블록, 페이지))
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> rwMap;
@@ -111,6 +128,13 @@ class FAST : public AbstractFTL {
   } batch;
 
   struct {
+    uint64_t policyBypass;
+    uint64_t policyForced;
+    uint64_t deferredLogs;
+    uint64_t vanishedOverwrite;
+    uint64_t vanishedMerge;
+    uint64_t vanishedTrim;
+    uint64_t selectedLbns;
     uint64_t switchMerge;
     uint64_t partialMerge;
     uint64_t fullMerge;
@@ -136,7 +160,7 @@ class FAST : public AbstractFTL {
   // sector 단위 조회와 쓰기
   bool isValid(uint32_t, uint32_t, uint32_t);
   bool findLatest(uint64_t, uint32_t, uint32_t &, uint32_t &);
-  void invalidateLatest(uint64_t, uint32_t);
+  void invalidateLatest(uint64_t, uint32_t, bool = false);
   void writeSector(uint32_t, uint32_t, uint64_t, uint32_t);
   void copySector(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
   void mapSector(uint64_t);
